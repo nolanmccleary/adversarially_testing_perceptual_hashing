@@ -258,8 +258,44 @@ def generate_inversion(inversion_str: str):
 </details>
 
 
-I've decided to use a bilinear transform for image resizing, but bicubic works fine as well. I have two versions of the inverse delta algorithm, the original `inverse_delta_local`, which I took from [the paper that I mentioned above](https://www.usenix.org/system/files/sec22-jain.pdf), and my own, `inverse_delta`, which I found experimentally worked better for most images. The core difference between the two is the local version uses the per-pixel average across all three channels at a given point on the 2-D image plane, while the nonlocal version uses the average across all pixels in all channels as the basis. This fixed an issue I was observing at higher distortion levels where the sharpest edges of the attacked images started to sparkle after the inverse delta was applied. While I was born to sparkle, my attacked images were not, and so I used the image-wide average instead, which traded the sparkles for a more spread out 'blotchy' distortion pattern during high-delta attacks. I also added an inverse luma transform which currently runs poorly so I won't talk about it. I feel like using some sort of box or tent filter (as I will discuss below)
+I've decided to use a bilinear transform for image resizing, but bicubic works fine as well. I have two versions of the inverse delta algorithm, the original `inverse_delta_local`, which I took from [the paper that I mentioned above](https://www.usenix.org/system/files/sec22-jain.pdf), and my own, `inverse_delta`, which I found experimentally worked better for most images. The core difference between the two is that the local version uses the per-pixel average across all three channels at a given point on the 2-D image plane, while the nonlocal version uses the average across all pixels in all channels as the basis. This fixed an issue I was observing at higher distortion levels where the sharpest, darkest edges of the attacked images started to sparkle after the inverse delta was applied. I believe this is due to the per-pixel RGB mean in these location being very low, so when applied to the delta transformation as a denominator, the delta gets scaled to an inappropriately large magnitude. While I was born to sparkle, my attacked images were not, and so I used the image-wide average instead, which traded the sparkles for a more spread out 'faded' distortion pattern during high-delta attacks. I also added an inverse luma transform, which currently runs poorly, so I won't talk about it. I feel like using some sort of box or tent filter (as I will discuss shortly)
 might provide a sort of happy middle ground here, and should be investigated further.
+
+#### Figure 2.1.0: Local vs Global Pixel Averaging Comparison
+<div style="display: flex; gap: 2rem; justify-content: center; align-items: flex-start;">
+
+  <!-- Local Averaging Panel -->
+  <div>
+    <h4 style="text-align: center; margin-bottom: 0.2em; color: #111;">Local Averaging</h4>
+    <img src="./diagrams/phash_attack_stallion_local.jpeg" width="750" alt="Local averaging during PHash attack" />
+    <pre style="background: #f5f5f5; color: #111; padding: 1em; border-radius: 4px; margin-top: 0.2em;">
+    Local Post-Validation:
+        lpips:             0.08449968695640564
+        l2:               0.13197070360183716
+        ahash_hamming:         14
+        dhash_hamming:         24
+        phash_hamming:        20
+        pdq_hamming:          40
+    </pre>
+  </div>
+
+  <!-- Global Averaging Panel -->
+  <div>
+    <h4 style="text-align: center; margin-bottom: 0.2em; color: #111;">Global Averaging</h4>
+    <img src="./diagrams/phash_attack_stallion.jpeg" width="750" alt="Non-local averaging during PHash attack" />
+    <pre style="background: #f5f5f5; color: #111; padding: 1em; border-radius: 4px; margin-top: 0.2em;">
+    Non Local Post-Validation:
+        lpips:             0.0440366193652153
+        l2:               0.12141172587871552
+        ahash_hamming:         17
+        dhash_hamming:         27
+        phash_hamming:        24
+        pdq_hamming:         36
+    </pre>
+  </div>
+
+</div>
+
 
 
 
