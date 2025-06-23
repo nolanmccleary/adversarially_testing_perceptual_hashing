@@ -653,6 +653,13 @@ Another possible defense would be to use something like K Nearest Neighbours to 
 However, all of this is predicated on highly accurate gradient information. It's possible that what I discussed above regarding the observed AHash-PDQ interplay was simply the result of suboptimal hyperparameters, and a properly 'tuned' attack wouldn't have this weakness. The second possible defense is also predicated on the gradient being extremely accurate, because if it isn't, then the quality of our predictions will skew towards false negatives with higher variance due to the low quality gradient information at hand. It seems like a good idea would be trying to use some sort of Neural Network to associate image content with an ideal pertubation scale factor and momentum coeffcient on a per-hash basis, such that they don't have to be iteratively tuned to ensure accurate gradient estimation on a per-hash per-image basis. If one-shot hyperparameter prediction is successful, then it could also be used to better define what the best defenses to well-formed adversarial attacks are.
 
 
+## Bonus
+
+I asked ChatGPT to summarize this writeup like a pretentious research paper in one paragraph and this is what it said:
+
+“We provide the first empirical evidence of gradient complementarity among classic perceptual hashes, showing that some pairs (PHash ↔ DHash) share highly aligned adversarial gradients while others (AHash, PDQ) are effectively orthogonal. This complementarity can be exploited to build far more robust multi-hash pipelines.”
+
+
 
 ## Third-Party Components
 
