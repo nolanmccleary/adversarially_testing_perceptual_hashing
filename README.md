@@ -349,7 +349,7 @@ Keep in mind the RGB hash algorithms are no longer supported and may not work ou
 
 Image quantization means that the image hashes between the working tensor and the new tensor pullled from the modifed image saved to disk will vary somewhat. To handle this, a quantization hook by the name of `quant_func` has been added as an optional attack paramter, allowing quantization loss to more effectively be modelled during gradient estimation. However, there are still other factors at play when our final delta is converted back from grayscale/luma to RGB and upsampled (we use a delta here versus the working tensor so these adverse effects aren't applied to the full image) that mean that the hamming delta/perceptual similarity ratio between pre-save and post-save images will differ, generally at the expense of the post-save image. In theory, one more effectively model this by using a quantization function that saves to disk in the desired format, then reloads the image afterwards, but this would create an absurd number of disk transactions when the grdient is being calculated which would probably not be advisable. It's highly likely that my current 8-bit quantization function `byte_quantize` doesn't accurately reflect all effects from the PIL image quantization process (for PNG or JPEG), so looking deeper into that would probably be a good idea.
 
-As a workaround, a post-save validation mechanism is used to get the final hamming delta and perceptural simliarity between images after the attacked image is saved to disk. It also uses the standard imagehash library to do so, in order to eliminate any discrepencies from my code from polluting the final output results.
+As a workaround, a post-save validation mechanism is used to get the final hamming delta and perceptual simliarity between images after the attacked image is saved to disk. It also uses the standard imagehash library to do so, in order to eliminate any discrepencies from my code from polluting the final output results.
 
 As stated earlier, the actual algorithm isn't too hard, and neither is the supporting logic. However, when you have to generate around 1000 32x32 normally distributed perturbation vectors, add all of them to their own copy of the image tensor, take a DCT of those resultant tensors (among other smaller operations along the way), and repeat this over 100-10000 cycles (depending on what you set your step size to be and how effective you want the attack), then do that over n many repetitions for each image in your image set, you will incurr a relatively nontrivial computational load. PDQ is especially bad, because cannonically the initial resize is to 512x512, after which an 8x8 tent convolution downsamples to 64x64 just in time for everything to get smacked by the DCT battery. Trying to do this on my CPU (which worked fine up until this point) resulted in my computer having a stroke. When I changed the initial resize to 128x128, it worked much better, but realistically if you want to test this system against PDQ you will most likely need access to a GPU (MPS/metal hasn't been working well and I think it has to do with Pytorch's limited Metal support, however CUDA has also been tested and it works great).
 
@@ -627,9 +627,50 @@ def _generate_pdq(tensor, dct_dim):
     return bits.to(torch.bool)
 
 
+def generate_pdq_batched(batched_tensor, dct_dim=16):
+    if batched_tensor.dim() == 3:
+        batched_tensor = batched_tensor.unsqueeze(0)
+    return torch.stack([_generate_pdq(v, dct_dim) for v in batched_tensor], dim=0)
+
 ```
 </details>
 
+
+The code above is somewhat non-intuitive, so explaining it may be a good idea. `generate_pdq_batched`, `_generate_pdq`, and `jarosz_filter` are functionally straightforward. Ironically, the Jarosz filterning and decimation were the most difficult parts in the pipeline to write code for, despite being the easiest to internally visualize, at least in my opinion. It's also a good way to get metaphorically thrown into the deep end of PyTorch syntax without a life jacket or water wings. However, a large inflatable flamingo that is somewhat difficult to climb onto will be provided in the form of what I am about to write. I will now attempt to explain PDQ Torch code:
+
+### 5.1.1 PDQ Code Explained
+
+`jarosz_filter` really returns the decimated filtered tensor, but that is self-evident. `jaros_pdq_tent` is also fairly straightforward if you are familiar with the Jarosz technique of implementing 2D filters through consecutive pairs of 1D filter passes. One pass along each of the rows (i.e. each row gets a 1D filter slid down it, ideally in true parallel depending on your chosen hardware), and one pass along each of the columns. Because we want a tent filter, we do this twice. We could keep doing this to get a smoother and smoother filter, but that is excessive, and our hardware is already in zone 4 if we are doing thousands of these in parallel (like during a gradient calculation). 
+
+The annoying parts are really in the details regarding how these lower-level bits are implemented efficiently.
+
+Once again, we are using 2D tent filter as our functional transformation. There are two ways that we can achieve separability here, and we can apply them in either order. I will go in the intuitive order, but that will also involve me going on a tangent here, and you will like it. We can separate a 2D 'bell' kernel into two 1D 'bell' kernels e.g. ```[0.25, 0.5, 1.5, 0.5, 0.25]``` and ```[[0.25, 0.5, 1.5, 0.5, 0.25]]```. We can do a parallelized pass along one axis, modify the tensor, and do another along the other axis (assuming a 2D tensor), wherein the first pass's modifications to the tensor get 'spread out' by the second pass such that the resultant effect is equivalent to a 2D filter kernel composed of the outer product of the vertical and horizontal kernels e.g. 
+
+```
+[[0.0625, 0.125, 0.375, 0.125, 0.0625],
+[0.125, 0.25, 0.75, 0.25, 0.125],
+[0.25, 0.5, 2.25, 0.5, 0.25],
+[0.125, 0.25, 0.75, 0.25, 0.125],
+[0.0625, 0.125, 0.375, 0.125, 0.0625]]
+```
+
+from the example 1D 'bell' kernels given above.
+
+However, we can also separate our 1D 'bell' kernel as well:
+
+[0.25, 0.5, 1, 0.5, 0.25] is really just what happens to a given point in pixel space when you slide [0.5, 1, 0.5] over another [0.5, 1, 0.5] (tent kernel), which itself is what happens when you slide [0.7071, 0.7071] over another [0.7071, 0.7071]. 
+
+This sliding has a name, and we call it convolution. What I just demonstrated above is an example of a recursive convolution hierarchy, this is the underlying process that lets us get smoother and smoother filters as we layer passes on top of each other. As you would expect, the distribution of this 1D kernel's weightings will get closer and closer to a Gaussian distribution as we keep stacking passes. Convolutions are linear, shift-invariant operations so we know commutativity holds. That is the formal reason for why we could make the 1D bell kernels first to compose the 2D bell kernel OR make the whole thing by ripping 1D box passes repeatedly along alternating axes. We choose the latter, because it's extremely wasteful to recursively create intermediary kernels in memory when we can just spank the tensor over and over again with two faithful box kernels instead. We can also simplify this further, becasue we only need tent kernels here, not bell kernels, and the only reason I did this example with bell kernels was so I could talk about recursion.
+
+A box filter, by definition of its boxiness, requires the same coeficient at each location in the filter. This means that the output of a box filter can be expressed as a moving sum of its substrate divided by some constant that we ourselves define. Thus to implement our box filters, the primitive we need is a moving sum filter.
+
+An efficient way we can collect a moving average across a given axis is to keep track of the cumulative sum of the tensor (cumsum) across our chosen axis of travel. For example given `x = [1, 2, 3, 4]` the cumsum would be `cum_sum = [1, 3, 6, 10]` and we could get the moving sum at index 1 and 2 as `cum_sum[2] - cum_sum[1 - 1] = 6 - 1 = x[1] + x[2] = 5`. If we wanted to turn this into a moving average filter, we could easily do that by dividing our cum sum delta by the cum sum index delta, in this case `2 - (1 - 1) = 2` so our moving average across x[1], x[2] is 5 / 2 = 2.5.
+
+Thus, the deepest primiives of our 2D tent filter implementation that actually exist in memory are not a pair of 1D box filter kernels, but actually a pair of 2D cum sum tensors that serve as lookup tables to express our kernels at any given point in runtime, allowing us to pitch our tent with minimal effort. 
+
+We now need to make two important clarification, which were implied before, but should be stated explicitly: Firstly, our box blurs do not modify the tensor while they are operating on it. What is meant by this is that if we apply [0.33, 0.33, 0.33] to x[1], such that x[1]_2 = (x[0] + x[1] + x[2])/3, we don't use x[1]_2 when computing x[2]_2, and so on and so forth. This means that we should create a new tensor from which to feed the box blur outputs into. Secondly, if we hit an edge, our filter gets truncated. For example, applying [0.33, 0.33, 0.33] on x[0] should give us only x[0]_2 = (x[0] + x[1])/2, not (x[-1] + x[0] + x[1])/3 or (x[0] + x[1])/3.
+
+There is also a third VERY important clarification that might not be immediately obvious. Our filter needs to preserve the energy content of the image. I mentioned earlier that we can get a tent filter from a covolution of two box kernels, but what should the coeffcients of those kernels be? I alluded earlier to using a moving average and there's actually a reason for that: the sum total of a moving average coeffcients add up to 1. What this means is that the sum total of coefficients of any convolution product of that box filter will also add to 1, as you would expect this keeps going indefinitely (assuming perfect precision of course). If we didn't do this, say we used a [0.7071, 0.7071] box kernel and thus a [0.5, 1, 0.5] tent kernel, then each pixel would on average get brighter and the total energy content of our image would increase. If we had box filters whose coefficients added up to less than 1, then the average brightness of the pixels would decrease and the image would get darker. In other words, we use a moving average for our box kernels so we can smooth the image without deep frying it.
 
 
 
