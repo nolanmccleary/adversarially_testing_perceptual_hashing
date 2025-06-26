@@ -351,9 +351,9 @@ Image quantization means that the image hashes between the working tensor and th
 
 As a workaround, a post-save validation mechanism is used to get the final hamming delta and perceptual simliarity between images after the attacked image is saved to disk. It also uses the standard imagehash library to do so, in order to eliminate any discrepencies from my code from polluting the final output results.
 
-As stated earlier, the actual algorithm isn't too hard, and neither is the supporting logic. However, when you have to generate around 1000 32x32 normally distributed perturbation vectors, add all of them to their own copy of the image tensor, take a DCT of those resultant tensors (among other smaller operations along the way), and repeat this over 100-10000 cycles (depending on what you set your step size to be and how effective you want the attack), then do that over n many repetitions for each image in your image set, you will incurr a relatively nontrivial computational load. PDQ is especially bad, because cannonically the initial resize is to 512x512, after which an 8x8 tent convolution downsamples to 64x64 just in time for everything to get smacked by the DCT battery. Trying to do this on my CPU (which worked fine up until this point) resulted in my computer having a stroke. When I changed the initial resize to 128x128, it worked much better, but realistically if you want to test this system against PDQ you will most likely need access to a GPU (MPS/metal hasn't been working well and I think it has to do with Pytorch's limited Metal support, however CUDA has also been tested and it works great).
+As stated earlier, the actual algorithm isn't too hard, and neither is the supporting logic. However, when you have to generate around 1000 32x32 normally distributed perturbation vectors, add all of them to their own copy of the image tensor, take a DCT of those resultant tensors (among other smaller operations along the way), and repeat this over 100-10000 cycles (depending on what you set your step size to be and how effective you want the attack), then do that over n many repetitions for each image in your image set, you will incurr a relatively nontrivial computational load. PDQ is especially bad, because cannonically the initial resize is to 512x512, after which a 7x7 tent convolution downsamples to 64x64 just in time for everything to get smacked by the DCT battery. Trying to do this on my CPU (which worked fine up until this point) resulted in my computer having a stroke. When I changed the initial resize to 128x128, it worked much better, but realistically if you want to test this system against PDQ you will most likely need access to a GPU (MPS/metal hasn't been working well and I think it has to do with PyTorch's limited Metal support, however CUDA has also been tested and it works great).
 
-This is all to say that everything that can be vectorized has been vectorized, it'll still run on a CPU normally, but Pytorch knows how to exploit multi-core architectures to the extent that there is still way more parallelism available than through something like numpy, which is a brick. This means that the top-end performance for well-vectorized torch code allows most hashes to be tested comfortably on the CPU at a rate far faster than a purely numpy-and-friends based implementation would allow.
+This is all to say that everything that can be vectorized has been vectorized, it'll still run on a CPU normally, but PyTorch knows how to exploit multi-core architectures to the extent that there is still way more parallelism available than through something like numpy, which is a brick. This means that the top-end performance for well-vectorized torch code allows most hashes to be tested comfortably on the CPU at a rate far faster than a purely numpy-and-friends based implementation would allow.
 
 To give an example of how vectorization is really useful here, I'd like to first touch on the Discrete Cosine Transform (DCT), which is a key component for most spectral hash algorithms including very well-known ones such as PHash and PDQ.
 
@@ -418,7 +418,7 @@ Notice how the top figure is perfectly symmetric around the horizontal axis whil
 
 Once we have our DCT projection matrix (standard convention is to use 8x8 for Phash and 16x16 for PDQ), we can go about computing our hash. With PDQ and PHash, this is done by taking the average of the DCT projection matrix cell values, setting up an NxN-bit sized piece of memory (where N is the DCT projection matrix side length), then going cell by cell across the flattened projection matrix and setting the corresponding bit to either 1 if it is greater than the average or 0 otherwise. Average hash (ahash) also does this as well, but it works on the actual image itself, generally after a downsample, rather than the DCT projection matrix.
 
-My code stores the hashes as tensors because they can be sized dynamically while also being very fast to operate on. This also makes it easy to handle hash values larger than 64 without having to create a separate struct of some sort for them (which adds complexity) or representing it as a standard array of some sort (which would be slow and need to be converted back anyways for any sort of pytorch runtime operation). As such, the entire hot loop of the system can use the pytorch runtime, which has proven to be a very nice time-saver versus the original implementation that primarily used numpy/scipy. This would be a good time to show off the relevant code, so here it is:
+My code stores the hashes as tensors because they can be sized dynamically while also being very fast to operate on. This also makes it easy to handle hash values larger than 64 without having to create a separate struct of some sort for them (which adds complexity) or representing it as a standard array of some sort (which would be slow and need to be converted back anyways for any sort of PyTorch runtime operation). As such, the entire hot loop of the system can use the PyTorch runtime, which has proven to be a very nice time-saver versus the original implementation that primarily used numpy/scipy. This would be a good time to show off the relevant code, so here it is:
 
 <details>
 <summary>Phash and DCT Code</summary>
@@ -491,7 +491,7 @@ self.num_pertubations = self.alpha
 
 PDQ is an open-source perceptual hash algorithm developed by Meta, it builds upon PHash by canonically using a 16x16 DCT projection matrix and thus a 256-bit hash. This allows more possibile image hashes to exist and reduces the probability that any two images will share the same hash value. This is normally a non-issue, but in the context of running the world's largest social media applications it starts to matter quite a bit more. The problem with this increased hash size is that it is now more susceptible to imperceptible high-frequency noise being added into the image. To get around this, an initial downsampling step is added before the DCT is taken such that any high-frequency noise added gets removed in the process. In other words, you can think of PDQ as a low-frequency DCT hash that has been 'hacked' to give a way larger hash space than it otherwise would be able to give. This isn't entirely accurate, because the downsample also makes the hash more resistant to low-frequency distortions as well, but it's a useful heuristic regardless. PDQ also uses a luma conversion in contrast to PHash, which uses grayscale.
 
-PDQ's downsample procedure, in the way I have implemented it (mostly faithful to the original spec) is composed of two main steps, a 2-D tent-convolution step and a decimation step. The tent-convolution step conventionally uses a Jarosz filter for efficiency. The Jarosz filter implements the 2D convolution kernel as a set of 1-D passes across the x and y axes. The reason we can do this is if we do a one-dimensional pass and then modify each pixel by it's filtered value accordingly, the modified pixel will now implictly encode that information when the next pass is applied to it, effectively acting like a single 2D kernel was used instead. To implement a box filter, we can do one x pass across every image row and one y pass across every image column in some given direction. To implement a tent filter, we can do the exact same thing again. This implements a tent filter by effectively sliding two box filters on top of each other. If we do this all again, we get a bell filter, and we can go back and forth like this until we effectively approximate a Gaussian blur, but that's excessive for our purposes so we stick with a tent filter. The dimensions of these 1-D Jarosz kernels are dynamically sized based on the input image but with a 512x512 image they are dimensioned with a height/width of 4, resulting in an 8x8-sized 2D tent kernel. 
+PDQ's downsample procedure, in the way I have implemented it (mostly faithful to the original spec) is composed of two main steps, a 2-D tent-convolution step and a decimation step. The tent-convolution step conventionally uses a Jarosz filter for efficiency. The Jarosz filter implements the 2D convolution kernel as a set of 1-D passes across the x and y axes. The reason we can do this is if we do a one-dimensional pass and then modify each pixel by it's filtered value accordingly, the modified pixel will now implictly encode that information when the next pass is applied to it, effectively acting like a single 2D kernel was used instead. To implement a box filter, we can do one x pass across every image row and one y pass across every image column in some given direction. To implement a tent filter, we can do the exact same thing again. This implements a tent filter by effectively sliding two box filters on top of each other. If we do this all again, we get a bell filter, and we can go back and forth like this until we effectively approximate a Gaussian blur, but that's excessive for our purposes so we stick with a tent filter. The dimensions of these 1-D Jarosz kernels are dynamically sized based on the input image but with a 512x512 image they are dimensioned with a height/width of 4, resulting in an 7x7-sized 2D tent kernel. 
 
 
 #### Figure 5.1.0 Filters Visualized
@@ -516,94 +516,95 @@ With all that said, here is my relevant 'pseudo-PDQ' code:
 <summary>Pseudo PDQ Code</summary>
 
 ```python
+_window_cache = {}
 
 def _get_window(N, w, device):
-    half = (w + 2) // 2
-    
-    p2 = w - half + 1
-    p3 = N - w
-    
-    j = torch.arange(N, device=device)
-    l = torch.empty(N, dtype=torch.long, device=device)
-    r = torch.empty(N, dtype=torch.long, device=device)
+    global _window_cache
+    key = (N, w, device)
 
-    mask1 = j < p2
-    l[mask1] = 0
-    r[mask1] = (half - 1) + j[mask1]
+    if key not in _window_cache:
+        half = (w + 2) // 2
+        
+        p2 = w - half + 1
+        p3 = N - w
+        
+        j = torch.arange(N, device=device)
+        l = torch.empty(N, dtype=torch.long, device=device)
+        r = torch.empty(N, dtype=torch.long, device=device)
 
-    mask2 = (j >= p2) & (j < p2 + p3)
-    i2 = j[mask2] - p2
-    l[mask2] = i2 + 1
-    r[mask2] = i2 + w
+        mask1 = j < p2
+        l[mask1] = 0
+        r[mask1] = (half - 1) + j[mask1]
 
-    mask3 = j >= (p2 + p3)
-    l[mask3] = j[mask3] - (w - half)
-    r[mask3] = N - 1
+        mask2 = (j >= p2) & (j < p2 + p3)
+        i2 = j[mask2] - p2
+        l[mask2] = i2 + 1
+        r[mask2] = i2 + w
 
-    return l, r
+        mask3 = j >= (p2 + p3)
+        l[mask3] = j[mask3] - (w - half)
+        r[mask3] = N - 1
+
+        _window_cache[key] = (l, r)
+
+    return _window_cache[key]
 
 
-def _box_filter_1d(x, w, dim):
-    N = x.size(dim)
-    device = x.device
+def _box_filter_1d(tensor, w, dim):
+    N = tensor.size(dim)
+    device = tensor.device
     l, r = _get_window(N, w, device)
 
-    ps = torch.cat([
-        torch.zeros_like(x.select(dim, 0).unsqueeze(dim)),
-        x.cumsum(dim=dim)
+    ps = torch.cat([                                              
+        torch.zeros_like(tensor.select(dim, 0).unsqueeze(dim)), #prepend padding
+        tensor.cumsum(dim=dim) #cum sum along the 'dim'th slice'
     ], dim=dim)  # shape[..., N+1]
 
-    r1 = (r + 1)
-
-    shape = list(x.shape)
+    shape = list(tensor.shape)
     idx_shape = shape.copy()
     idx_shape[dim] = N
     l_idx = l
-    r1_idx = r1
+    r_idx = r + 1
 
     for _ in range(dim):
         l_idx = l_idx.unsqueeze(0)
-        r1_idx = r1_idx.unsqueeze(0)
+        r_idx = r_idx.unsqueeze(0)
 
-    for _ in range(x.ndim - dim - 1):
+    for _ in range(tensor.ndim - dim - 1):
         l_idx = l_idx.unsqueeze(-1)
-        r1_idx = r1_idx.unsqueeze(-1)
+        r_idx = r_idx.unsqueeze(-1)
 
     l_idx = l_idx.expand(idx_shape)
-    r1_idx = r1_idx.expand(idx_shape)
+    r_idx = r_idx.expand(idx_shape)
 
-    sum_windows = ps.gather(dim, r1_idx) - ps.gather(dim, l_idx)
-    counts = (r - l + 1).to(x.dtype).view(
-        *([1]*dim + [N] + [1]*(x.ndim-dim-1))
-    ).expand(idx_shape)
+    sum_windows = ps.gather(dim, r_idx) - ps.gather(dim, l_idx)
+    counts = (r - l + 1).to(tensor.dtype).view(
+        *([1]*dim + [N] + [1]*(tensor.ndim-dim-1))
+    )
 
     return sum_windows.div(counts)
 
 
-def jarosz_pdq_tent(x):
-    C, H, W = x.shape
-
-    full_w_W = math.ceil(W / 128)
-    full_w_H = math.ceil(H / 128)
-    out = x
+def jarosz_pdq_tent(tensor, box_size):
+    out = tensor
     for _ in range(2):
-        out = _box_filter_1d(out, full_w_W, dim=2)  # rows
-        out = _box_filter_1d(out, full_w_H, dim=1)  # cols
+        out = _box_filter_1d(out, box_size, dim=2)  # Filter pass along rows
+        out = _box_filter_1d(out, box_size, dim=1)  # Filter pass along columns
     return out
 
 
-def pdq_decimate(x, D=64):
-    C, H, W = x.shape
-    device = x.device
+def pdq_decimate(tensor, D=64):
+    C, H, W = tensor.shape
+    device = tensor.device
 
     idxH = torch.floor(((torch.arange(D, device=device, dtype=torch.float) + 0.5) * H) / D).long()
     idxW = torch.floor(((torch.arange(D, device=device, dtype=torch.float) + 0.5) * W) / D).long()
 
-    return x.index_select(1, idxH).index_select(2, idxW)
+    return tensor.index_select(1, idxH).index_select(2, idxW)
 
 
-def jarosz_filter(tensor, out_dim=64):
-    blurred = jarosz_pdq_tent(tensor)
+def jarosz_filter(tensor, out_dim=64, box_size = 4):
+    blurred = jarosz_pdq_tent(tensor, box_size)
     return pdq_decimate(blurred, D=out_dim)
 
 
@@ -636,15 +637,15 @@ def generate_pdq_batched(batched_tensor, dct_dim=16):
 </details>
 
 
-The code above is somewhat non-intuitive, so explaining it may be a good idea. `generate_pdq_batched`, `_generate_pdq`, and `jarosz_filter` are functionally straightforward. Ironically, the Jarosz filterning and decimation were the most difficult parts in the pipeline to write code for, despite being the easiest to internally visualize, at least in my opinion. It's also a good way to get metaphorically thrown into the deep end of PyTorch syntax without a life jacket or water wings. However, a large inflatable flamingo that is somewhat difficult to climb onto will be provided in the form of what I am about to write. I will now attempt to explain PDQ Torch code:
+The code above is somewhat non-intuitive, so explaining it may be a good idea. `generate_pdq_batched`, `_generate_pdq`, and `jarosz_filter` are functionally straightforward. Ironically, the Jarosz filterning and decimation were the most difficult parts in the pipeline to write code for, despite being the easiest to internally visualize, at least in my opinion. It's also a good way to get metaphorically thrown into the deep end of PyTorch syntax without a life jacket or water wings. However, a large inflatable flamingo that is somewhat difficult to climb onto will be provided in the form of what I am about to write. I will now attempt to explain my PDQ Torch code.
 
 ### 5.1.1 PDQ Code Explained
 
-`jarosz_filter` really returns the decimated filtered tensor, but that is self-evident. `jaros_pdq_tent` is also fairly straightforward if you are familiar with the Jarosz technique of implementing 2D filters through consecutive pairs of 1D filter passes. One pass along each of the rows (i.e. each row gets a 1D filter slid down it, ideally in true parallel depending on your chosen hardware), and one pass along each of the columns. Because we want a tent filter, we do this twice. We could keep doing this to get a smoother and smoother filter, but that is excessive, and our hardware is already in zone 4 if we are doing thousands of these in parallel (like during a gradient calculation). 
+`jarosz_filter` really returns the decimated filtered tensor via `pdq_decimate`, but that is self-evident, and the decimation function is easy enough to understand. `jaros_pdq_tent` is also fairly straightforward if you are familiar with the Jarosz technique of implementing 2D filters through consecutive pairs of 1D filter passes. Each row gets a 1D filter slid down it, and then one pass along each of the columns or vice versa. Because we want a tent filter, we do this twice. We could keep doing this to get a smoother and smoother filter, but that is excessive, and our hardware will already be in zone 4 if we are doing thousands of these in parallel (like during a gradient calculation). 
 
 The annoying parts are really in the details regarding how these lower-level bits are implemented efficiently.
 
-Once again, we are using 2D tent filter as our functional transformation. There are two ways that we can achieve separability here, and we can apply them in either order. I will go in the intuitive order, but that will also involve me going on a tangent here, and you will like it. We can separate a 2D 'bell' kernel into two 1D 'bell' kernels e.g. ```[0.25, 0.5, 1.5, 0.5, 0.25]``` and ```[[0.25, 0.5, 1.5, 0.5, 0.25]]```. We can do a parallelized pass along one axis, modify the tensor, and do another along the other axis (assuming a 2D tensor), wherein the first pass's modifications to the tensor get 'spread out' by the second pass such that the resultant effect is equivalent to a 2D filter kernel composed of the outer product of the vertical and horizontal kernels e.g. 
+Once again, we are using 2D tent filter as our functional transformation. There are two ways that we can achieve separability here, and we can apply them in either order. I will go in the intuitive order, but that will also involve me going on a tangent here, and you will like it. We can separate a 2D 'bell' kernel into two 1D 'bell' kernels e.g. ```[0.25, 0.5, 1.5, 0.5, 0.25]``` and ```[[0.25, 0.5, 1.5, 0.5, 0.25]]```. We can do a parallelized pass along one axis, modify the tensor, then do another along the other axis (assuming a 2D tensor), wherein the first pass's modifications to the tensor get 'spread out' by the second pass, such that the resultant effect is equivalent to a 2D filter kernel composed of the outer product of the vertical and horizontal kernels e.g. 
 
 ```
 [[0.0625, 0.125, 0.375, 0.125, 0.0625],
@@ -658,20 +659,190 @@ from the example 1D 'bell' kernels given above.
 
 However, we can also separate our 1D 'bell' kernel as well:
 
-[0.25, 0.5, 1, 0.5, 0.25] is really just what happens to a given point in pixel space when you slide [0.5, 1, 0.5] over another [0.5, 1, 0.5] (tent kernel), which itself is what happens when you slide [0.7071, 0.7071] over another [0.7071, 0.7071]. 
+`[0.25, 0.5, 1, 0.5, 0.25]` is really just what happens to a given point in pixel space when you slide `[0.5, 1, 0.5]` over another `[0.5, 1, 0.5]` (tent kernel), which itself is what happens when you slide `[0.7071, 0.7071]` over another `[0.7071, 0.7071]`. 
 
-This sliding has a name, and we call it convolution. What I just demonstrated above is an example of a recursive convolution hierarchy, this is the underlying process that lets us get smoother and smoother filters as we layer passes on top of each other. As you would expect, the distribution of this 1D kernel's weightings will get closer and closer to a Gaussian distribution as we keep stacking passes. Convolutions are linear, shift-invariant operations so we know commutativity holds. That is the formal reason for why we could make the 1D bell kernels first to compose the 2D bell kernel OR make the whole thing by ripping 1D box passes repeatedly along alternating axes. We choose the latter, because it's extremely wasteful to recursively create intermediary kernels in memory when we can just spank the tensor over and over again with two faithful box kernels instead. We can also simplify this further, becasue we only need tent kernels here, not bell kernels, and the only reason I did this example with bell kernels was so I could talk about recursion.
+This sliding has a name, and we call it convolution. What I just demonstrated above is an example of a recursive convolution hierarchy, this is the underlying process that lets us get smoother and smoother filters as we layer passes on top of each other. As you would expect, the distribution of this 1D kernel's weightings will get closer and closer to a Gaussian distribution as we keep stacking passes. As you would expect in addition to the previously expected, convolutions are linear, shift-invariant operations, so we know that commutativity holds. That is the formal reason for why we could make the 1D bell kernels first to compose the 2D bell kernel OR make the whole thing by ripping 1D box passes repeatedly along alternating axes. We choose the latter, because it's extremely wasteful to recursively create intermediary kernels in memory when we can just slap the tensor over and over again with two faithful box kernels instead. We can also simplify this further, becasue we only need tent kernels here, not bell kernels, and the only reason I did this example with bell kernels was so that I could talk about recursion.
 
-A box filter, by definition of its boxiness, requires the same coeficient at each location in the filter. This means that the output of a box filter can be expressed as a moving sum of its substrate divided by some constant that we ourselves define. Thus to implement our box filters, the primitive we need is a moving sum filter.
+A box filter, by definition of its boxiness, requires the same coeficient at each location in the filter. This means that the output of a box filter can be expressed as a moving sum of its substrate divided by some constant that we ourselves define. Thus, to implement our box filters, the primitive we need is a moving sum filter.
 
-An efficient way we can collect a moving average across a given axis is to keep track of the cumulative sum of the tensor (cumsum) across our chosen axis of travel. For example given `x = [1, 2, 3, 4]` the cumsum would be `cum_sum = [1, 3, 6, 10]` and we could get the moving sum at index 1 and 2 as `cum_sum[2] - cum_sum[1 - 1] = 6 - 1 = x[1] + x[2] = 5`. If we wanted to turn this into a moving average filter, we could easily do that by dividing our cum sum delta by the cum sum index delta, in this case `2 - (1 - 1) = 2` so our moving average across x[1], x[2] is 5 / 2 = 2.5.
+An efficient way we can collect a moving average across a given axis is to keep track of the cumulative sum (cum sum) of the tensor across our chosen axis of travel. For example given `x = [1, 2, 3, 4]` the cum sum would be `cum_sum = [1, 3, 6, 10]` and we could get the moving sum at index 1 and 2 as `cum_sum[2] - cum_sum[1 - 1] = 6 - 1 = x[1] + x[2] = 5`. If we wanted to turn this into a moving average filter, we could easily do that by dividing our cum sum delta by the cum sum index delta, in this case `2 - (1 - 1) = 2` so our moving average across `x[1]`, `x[2] is 5 / 2 = 2.5`.
 
 Thus, the deepest primiives of our 2D tent filter implementation that actually exist in memory are not a pair of 1D box filter kernels, but actually a pair of 2D cum sum tensors that serve as lookup tables to express our kernels at any given point in runtime, allowing us to pitch our tent with minimal effort. 
 
-We now need to make two important clarification, which were implied before, but should be stated explicitly: Firstly, our box blurs do not modify the tensor while they are operating on it. What is meant by this is that if we apply [0.33, 0.33, 0.33] to x[1], such that x[1]_2 = (x[0] + x[1] + x[2])/3, we don't use x[1]_2 when computing x[2]_2, and so on and so forth. This means that we should create a new tensor from which to feed the box blur outputs into. Secondly, if we hit an edge, our filter gets truncated. For example, applying [0.33, 0.33, 0.33] on x[0] should give us only x[0]_2 = (x[0] + x[1])/2, not (x[-1] + x[0] + x[1])/3 or (x[0] + x[1])/3.
+We now need to make two important clarifications, which were implied before, but should be stated explicitly: Firstly, our box blurs do not modify the tensor while they are operating on it. What is meant by this is that if we apply `[0.33, 0.33, 0.33]` to `x[1]`, such that `x[1]_2 = (x[0] + x[1] + x[2])/3`, we don't use `x[1]_2` when computing `x[2]_2`, and so on and so forth. This means that we should create a new tensor from which to feed the box blur outputs into. Secondly, if we hit an edge, our filter gets truncated. For example, applying `[0.33, 0.33, 0.33]` on `x[0]` should give us only `x[0]_2 = (x[0] + x[1])/2`, not `(x[-1] + x[0] + x[1])/3` or `(x[0] + x[1])/3`.
 
-There is also a third VERY important clarification that might not be immediately obvious. Our filter needs to preserve the energy content of the image. I mentioned earlier that we can get a tent filter from a covolution of two box kernels, but what should the coeffcients of those kernels be? I alluded earlier to using a moving average and there's actually a reason for that: the sum total of a moving average coeffcients add up to 1. What this means is that the sum total of coefficients of any convolution product of that box filter will also add to 1, as you would expect this keeps going indefinitely (assuming perfect precision of course). If we didn't do this, say we used a [0.7071, 0.7071] box kernel and thus a [0.5, 1, 0.5] tent kernel, then each pixel would on average get brighter and the total energy content of our image would increase. If we had box filters whose coefficients added up to less than 1, then the average brightness of the pixels would decrease and the image would get darker. In other words, we use a moving average for our box kernels so we can smooth the image without deep frying it.
+There is also a third VERY important clarification that might not be immediately obvious. Our filter needs to preserve the energy content of the image. I mentioned earlier that we can get a tent filter from a covolution of two box kernels, but what should the coeffcients of those kernels be? I alluded earlier to using a moving average, and there's actually a reason for that: the sum total of a moving average filter's coeffcients add up to 1. What this means is that the sum total of coefficients of any convolution product of that box filter will also add up to 1. As you would expect, this keeps going indefinitely (assuming perfect precision of course) as our filters are repeatedly convolved with each other to create smoother filters higher up in the recursion hierarchy. If we didn't do this, say we used a `[0.7071, 0.7071]` box kernel and thus a `[0.5, 1, 0.5]` tent kernel, then each pixel would on average get brighter and the total energy content of our image would increase. If we had box filters whose coefficients added up to less than 1, then the average brightness of the pixels would decrease and the image would get darker. In other words, we specifically use a moving average for our box kernels so that we can smooth the image without deep frying it.
 
+As mentioned before, we are canonically using a 7x7 tent filter and so we use two length-4 box kernels `[0.25, 0.25, 0.25, 0.25]`. We orchestrate our box passes as follows, each pass building on the previous:
+
+```python
+box_size = 4
+out = tensor
+for _ in range(2):
+    out = _box_filter_1d(out, box_size, dim=2)  # Filter pass along rows
+    out = _box_filter_1d(out, box_size, dim=1)  # Filter pass along columns
+return out
+```
+
+I mentioned that we get our moving average by diffing a cum sum vector across two indices (let's call index 1 'left' and index 2 'right'), then dividing by the number of elements between those indices plus 1. For each box blur along each axis of travel we are going to set up three things off the bat: 
+
+1. A prefix sum tensor, which is a cum sum tensor zero-padded on the 'left' side. We zero pad so that ps[k] = sum over tensor[:k] (noninclusive summage).
+2. A tensor to keep track of the 'left' prefix sum indices down our axis for every filter position.
+3. A tensor to keep track of the 'right' prefix sum indices down our axis for every filter position. There should be as many as the first tensor.
+
+```python
+
+l, r = _get_window(N, w, device)
+
+ps = torch.cat([                                                
+    torch.zeros_like(tensor.select(dim, 0).unsqueeze(dim)),
+    tensor.cumsum(dim=dim)                      
+], dim=dim)  # shape[..., N+1]
+
+```
+
+Now we shift our 'right' index tensor `r = (r + 1)`. Doing this lets us do compute the moving total as `MT[l, r] = ps[r] - ps[l]`.
+
+We want to vectorize everything because we strongly dislike redundant loops. Our prefix sum tensor is the same shape as our image tensor with one extra index along the `dim` dimension, which was added from the padding. Accessing it with the raw index vectors would be very messy, so we format them to match the shape of our tensor. We do this by setting the same number of dimensions before and after the index tensor.
+
+```python
+l_idx = l
+r_idx = r + 1
+
+for _ in range(dim):
+    l_idx = l_idx.unsqueeze(0)
+    r_idx = r_idx.unsqueeze(0)
+
+for _ in range(tensor.ndim - dim - 1):
+    l_idx = l_idx.unsqueeze(-1)
+    r_idx = r_idx.unsqueeze(-1)
+
+l_idx = l_idx.expand(idx_shape)
+r_idx = r_idx.expand(idx_shape)
+```
+
+Now all we need to do is create a tensor of these prefix sum deltas. These deltas, when divided by the appropriate value, represent the filtered value of the pixel in that particular location. We can use the 'gather' operator to gather the PS values mapping to the 'right' index vector along dimension 'dim', and then subtract from it the tensor composed of the PS elements mapping from the 'left' index set. From a functional perspective, this should give us exactly as many elements as there are pixels in the image, where each element represents the filter output for that pixel scaled by some constant that we are about to divide out. Given a C, H, W dimensioned image tensor, if dim = 1, these diffs are performed down each of the columns. If dim = 2, these diffs are performed across each of the rows.
+```python
+sum_windows = ps.gather(dim, r_idx) - ps.gather(dim, l_idx)
+```
+
+We now have to divide our delta tensor accroding to get our filtered values. As a side note, I found I was actually better able to obtain the PDQ gradient by doing a constant division by 4 across all elements (indicating that I either messed this step up WRT cannonical PDQ or that my hyperparameters were highly suboptimal, or both lol). However, in order to align with the cannonical PDQ spec (as I have interpreted it), I will stick to honoring the filter truncation rule I listed above. As such, we do the following:
+
+```python
+
+sum_windows = ps.gather(dim, r_idx) - ps.gather(dim, l_idx)
+    counts = (r - l + 1).to(tensor.dtype).view(
+        *([1]*dim + [N] + [1]*(tensor.ndim-dim-1))
+    )
+    
+    return sum_windows.div(counts)
+
+```
+
+At this point, you may be wondering how the window got calculated. Here is how the window got calculated:
+
+```python
+_window_cache = {}
+
+def _get_window(N, w, device):
+    global _window_cache
+    key = (N, w, device)
+
+    if key not in _window_cache:
+        half = (w + 2) // 2
+        
+        p2 = w - half + 1
+        p3 = N - w
+        
+        j = torch.arange(N, device=device)
+        l = torch.empty(N, dtype=torch.long, device=device)
+        r = torch.empty(N, dtype=torch.long, device=device)
+
+        mask1 = j < p2
+        l[mask1] = 0
+        r[mask1] = (half - 1) + j[mask1]
+
+        mask2 = (j >= p2) & (j < p2 + p3)
+        i2 = j[mask2] - p2
+        l[mask2] = i2 + 1
+        r[mask2] = i2 + w
+
+        mask3 = j >= (p2 + p3)
+        l[mask3] = j[mask3] - (w - half)
+        r[mask3] = N - 1
+
+        _window_cache[key] = (l, r)
+
+    return _window_cache[key]
+
+```
+
+
+Intuitively you can pretend that we have a row of numbered beads from 0 to N-1 lying on a table. We now pick up little cardboard frame that's just wide enough to cover w beads at a time. The goal is to figure out which bead the frame covers if you try to centre it on bead i. The one rule is that if the frame would hang off the table, we want to slide it inwards until either its left edge sits on bead 0 or its right edge sits at bead N - 1. 
+
+Playing this game will let us create two artifacts:
+
+1. l[i] - the leftmost bead index when the frame is centered on bead i
+2. r[i] - the rightmost bead index when the frame is centered on bead i
+
+We can combine these indices for all values of i. Ultimately generating the window tensors l and r which we used above. In other words, range(l[i], r[i]+1) (RHS noninclusive) is the effective window around bead i. We feed this window to our prefix sum delta conversion and divide by the window size to get our filtered value for pixel i.
+
+
+If we already have a valid window tensor we can use that. If we don't, then we make one by twiddling our bits to escape the monotony of a for loop. 
+
+First we precompute some handy constants:
+
+```python
+half = (w + 2) // 2
+p2 = w - half + 1
+p3 = N - w
+```
+
+Afterwards we initialize our window tensors `l` and `r`, as well as an index tensor `j`. Then we get a tensor of all indices less than one half-box out from 0 `mask1 = j < p2`. We use the mask to clear the 'left' tensor as follows:
+
+```python
+j = torch.arange(N, device=device)
+l = torch.empty(N, dtype=torch.long, device=device)
+r = torch.empty(N, dtype=torch.long, device=device)
+
+mask1 = j < p2
+l[mask1] = 0
+```
+
+Our mask is a Boolean tensor, and PyTorch lets us access another tensor's indices with it based on whether or not the mask value in that index is true or not. For example, if our mask element at index 3 is True and all others are false, then setting `l[mask1] = 0` lets us zero `l[3]` without affecting any other element. 
+
+What we are actually saying in the above is "all target points before the halfway mark of the first window (half a window's width away starting at index 0) will have the left-hand part of their cardboard frame at index 0." This is done so the left-hand side isn't hanging off-table as previously mentioned.
+
+Then we say "all target points before the halfway mark have the right-hand side of their frame covering up to and including the point that lies at the halfway point plus the target point offset minus 1". Or in other words, "all target points before the halfway mark have the right-hand side of their frame covering up to the point that lies at the halfway point plus the target point offset non-inclusive".
+Or in other words, "all target points before the halfway mark have the right-hand edge of their box one half-box away from the target point" (as we'd expect).
+
+```python
+r[mask1] = (half - 1) + j[mask1]
+```
+
+Again, the semantics are simple, the syntax is cursed. We now say "Give me all indices of points that are equal to or greater than one half of a frame away from zero (because we just handled the ones that weren't) and further than one half-box away from the right-hand edge (because that is it's own edge case that we will adress later)." We are now doing the middle case, which is chill.
+
+```python
+mask2 = (j >= p2) & (j < p2 + p3)
+```
+
+Now we say "The left edges should be one half-box to the left of this target point set and the right edges should be one half-box to the right of it". This is intuitive.
+
+```python
+i2 = j[mask2] - p2
+l[mask2] = i2 + 1
+r[mask2] = i2 + w
+```
+
+Now all that's left is the RHS edge case. First we say "give me a set of all points that are within one half-box away from the right-hand side of the table", followed by "the left-hand sides of the boxes should stick out one half-box length away from wherever the target box is defined", followed by "the right-hand sides of the boxes should be flush with the edge of the table i.e. the box should include the rightmost point on the table as it's rightmost point (relatively obvious)"
+
+```python
+mask3 = j >= (p2 + p3)
+l[mask3] = j[mask3] - (w - half)
+r[mask3] = N - 1
+```
+
+Finally, we say "I want a milkshake", because it's 40 degrees outside, and we are overheating. Unfortunately, this document cannot provide milkshakes, only knowledge, so you will have to get it yourself. 
 
 
 ## 6.0 Observations
@@ -700,7 +871,9 @@ I asked ChatGPT to summarize this writeup like a pretentious research paper in o
 
 “We provide the first empirical evidence of gradient complementarity among classic perceptual hashes, showing that some pairs (PHash ↔ DHash) share highly aligned adversarial gradients while others (AHash, PDQ) are effectively orthogonal. This complementarity can be exploited to build far more robust multi-hash pipelines.”
 
+Really, what's most likely going on is that the cheapest PDQ evasion directions live mostly in the aHash null-space (higher frequency perturbation noise), whereas the cheapest aHash evasion directions, which are predominantly DC-valued, are much less likely to live inside the PDQ null-space, because DC noise absolutely destroys PDQ (albeit with a rather large distortion budget). This is most likely why PDQ attacks barely affect aHash but not the other way around. Regardless, it can still be exploited.
 
+I'm pretty confident that Meta would have figured this out internally, but they haven't publicly released anything yet as far as I know.
 
 ## Third-Party Components
 
