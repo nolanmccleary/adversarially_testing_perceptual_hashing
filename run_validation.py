@@ -1,10 +1,66 @@
 import imagehash
+import os
 import struct
 import zlib
 import torch
 from PIL import Image
-from spectra.hashes.PDQ import PDQHasher
+from PDQ import PDQHasher
 import numpy as np
+from pathlib import Path
+import lpips
+import json
+import torch.nn.functional as F
+
+
+
+def tensor_resize(input_tensor, height, width):
+    tensor = input_tensor.clone().unsqueeze(0)      #[{3,1}, H, W] -> [1, {3, 1}, H, W]
+    tensor_resized = F.interpolate(                 #Interpolate needs to know batch and channel dimensions thus a 4-d tensor is required
+        tensor,
+        size=(height, width),
+        mode='bilinear',
+        align_corners=False
+    )
+    return tensor_resized.squeeze(0)                #[1, {3, 1}, H, W] -> [{3,1}, H, W]
+
+
+
+class ALEX_IMPORT:
+    
+    def __init__(self, device="cpu"):
+        self.device = device
+        self.model = lpips.LPIPS(net='alex').to(device)
+
+
+    def get_lpips(self, old_tensor: torch.Tensor, new_tensor: torch.Tensor) -> float:
+        old = old_tensor.clone().to(self.device)
+        new = new_tensor.clone().to(self.device)
+
+        C, H, W = old.shape
+
+        if H * W < 1024:
+            W = 32
+            H = 32
+            old = tensor_resize(old, H, W)
+            new = tensor_resize(new, H, W)
+
+        a3 = torch.zeros_like(old).to(self.device)
+        b3 = torch.zeros_like(new).to(self.device)
+
+        if C == 1:
+            a = old.view(1, 1, H, W) * 2.0 - 1.0
+            b = new.view(1, 1, H, W) * 2.0 - 1.0
+
+            a3 = a.repeat(1, 3, 1, 1)
+            b3 = b.repeat(1, 3, 1, 1)
+
+        else:
+            a3 = old.unsqueeze(0)
+            b3 = new.unsqueeze(0)
+
+        output = self.model(a3, b3)
+        return output.item()
+
 
 
 ############################## UTILS ###############################################################
@@ -19,6 +75,7 @@ def get_rgb_tensor(image_object, rgb_device):
 
 def l2_delta(a, b):
     return torch.sqrt(torch.mean((a - b).pow(2))).item()
+
 
 
 ############################# HASH COMPARISON ######################################################
@@ -228,7 +285,7 @@ def parse_jpeg_metadata(jpeg_path):
 ##########################################################################################################
 
 
-def image_compare(img_path_1, img_path_2, lpips_func, device="cpu", verbose = "off"):
+def image_compare(img_path_1, img_path_2, lpips_func, device, verbose):
     
     img_1 = None
     img_2 = None
@@ -298,3 +355,99 @@ def image_compare(img_path_1, img_path_2, lpips_func, device="cpu", verbose = "o
         "pdq_hamming"   : str(pdq_delta),
         "error_log"     : error_log
     }
+
+
+
+def directory_compare(input_dir, output_dir, lpips_func, device, verbose="off"):
+    """
+    Compare every output image in output_dir against its corresponding
+    input in input_dir. Outputs are assumed named <prefix>_<input_filename>.
+    Returns a dict of the form:
+      {
+        "<prefix>": {
+          "<input_filename>": { …results of image_compare… },
+          …,
+          "average": {
+            "lpips": …,
+            "l2": …,
+            "ahash_hamming": …,
+            "dhash_hamming": …,
+            "phash_hamming": …,
+            "pdq_hamming": …
+          }
+        },
+        …
+      }
+    """
+    input_dir  = Path(input_dir)
+    output_dir = Path(output_dir)
+
+    input_files = {f.name: f for f in input_dir.iterdir() if f.is_file()}
+
+    results: dict[str, dict[str, dict]] = {}
+
+    for out_path in output_dir.iterdir():
+        if not out_path.is_file():
+            continue
+        out_name = out_path.name
+
+        match = None
+        for in_name in input_files:
+            suffix = f"_{in_name}"
+            if out_name.endswith(suffix):
+                prefix = out_name[: -len(suffix)]
+                match  = in_name
+                break
+
+        if match is None:
+            if verbose == "on":
+                print(f"Skipping unmatched output: {out_name}")
+            continue
+
+        in_path = input_files[match]
+        cmp_res = image_compare(
+            str(in_path),
+            str(out_path),
+            lpips_func,
+            device,
+            verbose
+        )
+
+        results.setdefault(prefix, {})[match] = cmp_res
+
+    for prefix, entries in results.items():
+        sums = {}
+        count = 0
+
+        for img_name, metrics in entries.items():
+            if img_name == "average":
+                continue
+            count += 1
+            for key, val in metrics.items():
+                if key == "error_log":
+                    continue
+                num = float(val)
+                sums[key] = sums.get(key, 0.0) + num
+
+        avg_metrics = { key: (sums[key] / count) for key in sums }
+        entries["average"] = avg_metrics
+
+    return results
+
+
+def validate(dev):
+    LPIPS_MODEL = ALEX_IMPORT("cpu")
+    F_LPIPS = LPIPS_MODEL.get_lpips
+    
+    post_validation = directory_compare('sample_images', 'output', F_LPIPS, dev)
+    json_filename = "post_validation.json"
+
+    with open(json_filename, 'w') as f:
+        json.dump(post_validation, f, indent=4)
+
+
+#May take a little while if you are running on your CPU
+if __name__ == '__main__':
+    validate("cpu")
+
+
